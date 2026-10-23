@@ -1,10 +1,13 @@
 import os
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
+from telegram.request import HTTPXRequest
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 # ==========================================
-# KONFIGURASI GAMBAR
+# 1. KONFIGURASI & FUNGSI PEMBUAT GAMBAR
 # ==========================================
 CANVAS_WIDTH = 1080
 CANVAS_HEIGHT = 1350
@@ -85,7 +88,7 @@ def buat_slide_narasi(template_path, photo_path, teks_narasi, font_path, output_
 
 
 # ==========================================
-# PENYIMPANAN SESI USER (MENGATUR ALUR 2 LANGKAH)
+# 2. ALUR 2 LANGKAH BOT TELEGRAM
 # ==========================================
 user_sessions = {}
 
@@ -94,17 +97,16 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
     user_id = message.from_user.id
     
     if not message.photo or not message.caption:
-        await message.reply_text("⚠️ Silakan kirim foto beserta *caption* teksnya ya!")
+        await message.reply_text("⚠️ Silakan kirim foto beserta caption teksnya ya!")
         return
 
-    # Cek apakah user sedang berada di tahap menunggu Foto ke-2 (Narasi)
+    # Tahap ke-2: Menerima Foto & Narasi (Slide 2)
     if user_id in user_sessions and user_sessions[user_id]["step"] == "waiting_for_slide2":
-        # Ini adalah proses untuk SLIDE KEDUA (Narasi)
-        session = user_sessions.pop(user_id) # Hapus sesi setelah selesai
+        session = user_sessions.pop(user_id)
         judul = session["judul"]
         foto1_path = session["foto1_path"]
-        
         narasi = message.caption
+
         await message.reply_text("⏳ Memproses Slide 1 & Slide 2...")
 
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -119,20 +121,21 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
         path_out1 = os.path.join(base_dir, f"hasil_slide1_{user_id}.jpg")
         path_out2 = os.path.join(base_dir, f"hasil_slide2_{user_id}.jpg")
 
-        # Generate kedua slide
         buat_slide_judul(template_path, foto1_path, judul, font_bold, path_out1)
         buat_slide_narasi(template_path, foto2_path, narasi, font_regular, path_out2)
 
-        # Kirim hasil ke Telegram
-        await context.bot.send_photo(chat_id=message.chat_id, photo=open(path_out1, "rb"), caption="✅ Slide 1: Cover Judul")
-        await context.bot.send_photo(chat_id=message.chat_id, photo=open(path_out2, "rb"), caption="✅ Slide 2: Narasi Singkat")
+        with open(path_out1, "rb") as f1:
+            await context.bot.send_photo(chat_id=message.chat_id, photo=f1, caption="✅ Slide 1: Cover Judul")
+        with open(path_out2, "rb") as f2:
+            await context.bot.send_photo(chat_id=message.chat_id, photo=f2, caption="✅ Slide 2: Narasi Singkat")
 
-        # Bersihkan file sementara foto pertama
-        if os.path.exists(foto1_path):
-            os.remove(foto1_path)
+        # Bersihkan file sementara agar penyimpanan server tidak penuh
+        for p in [foto1_path, foto2_path, path_out1, path_out2]:
+            if os.path.exists(p):
+                os.remove(p)
 
+    # Tahap ke-1: Menerima Foto & Judul (Slide 1)
     else:
-        # Ini adalah proses pertama: Menerima FOTO & JUDUL (Slide 1)
         judul = message.caption
         base_dir = os.path.dirname(os.path.abspath(__file__))
         foto1_path = os.path.join(base_dir, f"temp_foto1_{user_id}.jpg")
@@ -140,7 +143,6 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
         photo_file = await message.photo[-1].get_file()
         await photo_file.download_to_drive(foto1_path)
 
-        # Simpan data sementara ke sesi user, lalu minta foto kedua
         user_sessions[user_id] = {
             "step": "waiting_for_slide2",
             "judul": judul,
@@ -148,27 +150,40 @@ async def handle_incoming_message(update: Update, context: ContextTypes.DEFAULT_
         }
 
         await message.reply_text(
-            "✅ **Slide 1 (Judul) tersimpan!**\n\n"
-            "Sekarang kirim **Foto ke-2** beserta **caption narasi singkatnya** untuk Slide 2."
+            "✅ Slide 1 (Judul) tersimpan!\n\n"
+            "Sekarang kirim Foto ke-2 beserta caption narasi singkatnya untuk Slide 2."
         )
 
-from telegram.ext import ApplicationBuilder
-from telegram.request import HTTPXRequest # Tambahkan baris ini di atas jika belum ada
-import os
+
+# ==========================================
+# 3. WEB SERVER MINI & JALANKAN BOT
+# ==========================================
+class SimpleHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot Suaradata Aktif 24 Jam!")
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), SimpleHandler)
+    server.serve_forever()
 
 def main():
-    # Mengambil token secara aman dari sistem server Render
-    TOKEN = os.getenv("TELEGRAM_TOKEN")
+    # Mengambil token dari Environment Variable Render, atau pakai fallback token lokal
+    TOKEN = os.getenv("TELEGRAM_TOKEN", "8871869260:AAGwquQqtmpnRo8NlTyeg80VoaNaQnc6UWc")
     
-    if not TOKEN:
-        print("ERROR: Token Telegram belum diset di Environment Variable!")
-        return
-    
+    # Nyalakan web server palsu di background supaya Render Web Service gratis bisa jalan
+    t = threading.Thread(target=run_web_server)
+    t.daemon = True
+    t.start()
+
+    # Nyalakan Bot Telegram
     custom_request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
     app = ApplicationBuilder().token(TOKEN).request(custom_request).build()
     app.add_handler(MessageHandler(filters.PHOTO & filters.CAPTION, handle_incoming_message))
     
-    print("🤖 Bot Telegram Suaradata sedang berjalan di Cloud...")
+    print("🤖 Bot Telegram Suaradata sedang berjalan...")
     app.run_polling()
 
 if __name__ == "__main__":
